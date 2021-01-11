@@ -12,6 +12,7 @@
 # Contributors:
 #    Roger Light - initial API and implementation
 #    Ian Craggs - MQTT V5 support
+import sslpsk
 
 from .subscribeoptions import SubscribeOptions
 from .reasoncodes import ReasonCodes
@@ -634,6 +635,8 @@ class Client(object):
         self._thread_terminate = False
         self._ssl = False
         self._ssl_context = None
+        self._psk_identity = None
+        self._psk_key = None
         # Only used when SSL context does not have check_hostname attribute
         self._tls_insecure = False
         self._logger = None
@@ -761,7 +764,8 @@ class Client(object):
         if hasattr(context, 'check_hostname'):
             self._tls_insecure = not context.check_hostname
 
-    def tls_set(self, ca_certs=None, certfile=None, keyfile=None, cert_reqs=None, tls_version=None, ciphers=None):
+    def tls_set(self, ca_certs=None, certfile=None, keyfile=None, identity=None, key=None,
+                cert_reqs=None, tls_version=None, ciphers=None):
         """Configure network encryption and authentication options. Enables SSL/TLS support.
 
         ca_certs : a string path to the Certificate Authority certificate files
@@ -807,16 +811,25 @@ class Client(object):
             raise ValueError(
                 'Python 2.7.9 and 3.2 are the minimum supported versions for TLS.')
 
-        if ca_certs is None and not hasattr(ssl.SSLContext, 'load_default_certs'):
-            raise ValueError('ca_certs must not be None.')
-
         # Create SSLContext object
         if tls_version is None:
             tls_version = ssl.PROTOCOL_TLSv1
             # If the python version supports it, use highest TLS version automatically
             if hasattr(ssl, "PROTOCOL_TLS"):
                 tls_version = ssl.PROTOCOL_TLS
+
         context = ssl.SSLContext(tls_version)
+
+        if identity and key:
+            self._psk_identity = identity
+            self._psk_key = key
+
+            self.tls_set_context(context)
+            return
+
+        if ca_certs is None and not hasattr(ssl.SSLContext, 'load_default_certs'):
+            raise ValueError('ca_certs must not be None.')
+
 
         # Configure context
         if certfile is not None:
@@ -1075,36 +1088,47 @@ class Client(object):
         sock = self._create_socket_connection()
 
         if self._ssl:
-            # SSL is only supported when SSLContext is available (implies Python >= 2.7.9 or >= 3.2)
+            if self._psk_key and self._psk_identity:
+                sock = sslpsk.wrap_socket(
+                    sock,
+                    psk=lambda hint: (self._psk_key.encode(), self._psk_identity.encode()),
+                    ciphers='ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH',
+                    do_handshake_on_connect=True,
+                    ssl_version=ssl.PROTOCOL_TLSv1_2
+                )
 
-            verify_host = not self._tls_insecure
-            try:
-                # Try with server_hostname, even it's not supported in certain scenarios
-                sock = self._ssl_context.wrap_socket(
-                    sock,
-                    server_hostname=self._host,
-                    do_handshake_on_connect=False,
-                )
-            except ssl.CertificateError:
-                # CertificateError is derived from ValueError
-                raise
-            except ValueError:
-                # Python version requires SNI in order to handle server_hostname, but SNI is not available
-                sock = self._ssl_context.wrap_socket(
-                    sock,
-                    do_handshake_on_connect=False,
-                )
             else:
-                # If SSL context has already checked hostname, then don't need to do it again
-                if (hasattr(self._ssl_context, 'check_hostname') and
-                        self._ssl_context.check_hostname):
-                    verify_host = False
+                # SSL is only supported when SSLContext is available (implies Python >= 2.7.9 or >= 3.2)
+    
+                verify_host = not self._tls_insecure
+                try:
+                    # Try with server_hostname, even it's not supported in certain scenarios
+                    sock = self._ssl_context.wrap_socket(
+                        sock,
+                        server_hostname=self._host,
+                        do_handshake_on_connect=False,
+                    )
+                except ssl.CertificateError:
+                    # CertificateError is derived from ValueError
+                    raise
+                except ValueError:
+                    # Python version requires SNI in order to handle server_hostname, but SNI is not available
+                    sock = self._ssl_context.wrap_socket(
+                        sock,
+                        do_handshake_on_connect=False,
+                    )
+                else:
+                    # If SSL context has already checked hostname, then don't need to do it again
+                    if (hasattr(self._ssl_context, 'check_hostname') and
+                            self._ssl_context.check_hostname):
+                        verify_host = False
+    
+                sock.settimeout(self._keepalive)
+                sock.do_handshake()
+    
+                if verify_host:
+                    ssl.match_hostname(sock.getpeercert(), self._host)
 
-            sock.settimeout(self._keepalive)
-            sock.do_handshake()
-
-            if verify_host:
-                ssl.match_hostname(sock.getpeercert(), self._host)
 
         if self._transport == "websockets":
             sock.settimeout(self._keepalive)
